@@ -10,7 +10,10 @@ param (
     [string]$ProjectPattern,
     [switch]$ProjectPatternIsRegex,
 
+    [ValidatePattern('^https?://')]
+    [ValidateNotNullOrEmpty()]
     [string]$BitbucketBaseUrl = "https://bitbucket.agile.bns",
+    [ValidateNotNullOrEmpty()]
     [string]$Branch = "master",
     [string[]]$FallbackBranches = @("main"),
 
@@ -74,7 +77,7 @@ if ($hasProject -and $hasPattern) {
 # Import Utility Functions
 # =====================================================================
 
-$modulePath = Join-Path $PWD "BitbucketUtils.psm1"
+$modulePath = Join-Path $PSScriptRoot "BitbucketUtils.psm1"
 if (Test-Path $modulePath) {
     Import-Module $modulePath -Force
 } else {
@@ -175,7 +178,7 @@ $job = $targetProjects.key | ForEach-Object -Parallel {
     $localFromUtc            = $using:fromUtc
     $localToUtc              = $using:toUtc
 
-    $localModulePath = Join-Path $using:PWD "BitbucketUtils.psm1"
+    $localModulePath = Join-Path $using:PSScriptRoot "BitbucketUtils.psm1"
     if (Test-Path $localModulePath) {
         Import-Module $localModulePath
     }
@@ -234,13 +237,52 @@ $job = $targetProjects.key | ForEach-Object -Parallel {
             $ref = [Uri]::EscapeDataString("refs/heads/$b")
             $commitBase = "$localBase/rest/api/1.0/projects/$currentProject/repos/$($repo.slug)/commits?until=$ref&limit=1000"
 
-            $commitValues = Get-PagedValues -UriWithoutStart $commitBase `
-                                            -Headers $localHeaders `
-                                            -ThrottleDelayMs $localApiThrottleDelayMs `
-                                            -Retries $localMaxApiRetries
+            $start = 0
+            $isLastPage = $false
+            $branchCommits = [System.Collections.Generic.List[object]]::new()
+            $apiFailed = $false
 
-            if ($null -ne $commitValues) {
-                $repoCommits = @($commitValues)
+            while (-not $isLastPage) {
+                $uri = "$commitBase&start=$start"
+                $resp = Invoke-Api -Uri $uri -Headers $localHeaders -ThrottleDelayMs $localApiThrottleDelayMs -Retries $localMaxApiRetries
+
+                if ($null -eq $resp) {
+                    $apiFailed = $true
+                    break
+                }
+
+                $allOlderThanFromDate = $true
+                $hasCommitsInPage = $false
+
+                if ($resp.values) {
+                    foreach ($c in $resp.values) {
+                        $hasCommitsInPage = $true
+                        $dt = Convert-TS -ts $c.committerTimestamp
+                        if ($null -eq $localFromUtc -or $dt -ge $localFromUtc) {
+                            $allOlderThanFromDate = $false
+                        }
+                        $branchCommits.Add($c)
+                    }
+                }
+
+                if ($hasCommitsInPage -and $null -ne $localFromUtc -and $allOlderThanFromDate) {
+                    # All commits in this page are older than FromDate. We can stop paginating early.
+                    break
+                }
+
+                if ($null -eq $resp.isLastPage) {
+                    $isLastPage = $true
+                } else {
+                    $isLastPage = [bool]$resp.isLastPage
+                }
+
+                if (-not $isLastPage) {
+                    $start = [int]$resp.nextPageStart
+                }
+            }
+
+            if (-not $apiFailed -or $branchCommits.Count -gt 0) {
+                $repoCommits = @($branchCommits)
                 $usedBranch  = $b
                 break
             }
@@ -300,8 +342,16 @@ $job = $targetProjects.key | ForEach-Object -Parallel {
 # Progress + ETA monitor
 # =====================================================================
 
+$payloads = [System.Collections.Generic.List[object]]::new()
+
 while ($job.State -in @('NotStarted', 'Running')) {
     $childJobs = @($job.ChildJobs)
+
+    foreach ($cj in $childJobs) {
+        if ($cj.State -in @('Completed', 'Failed', 'Stopped') -and $cj.HasMoreData) {
+            $payloads.AddRange(@(Receive-Job -Job $cj))
+        }
+    }
 
     $completedCount = @(
         $childJobs | Where-Object { $_.State -in @('Completed', 'Failed', 'Stopped') }
@@ -351,7 +401,12 @@ Write-Progress -Id 1 -Activity "Processing Bitbucket Projects" -Completed
 # Collect results
 # =====================================================================
 
-$payloads = Receive-Job -Job $job -Wait -AutoRemoveJob
+foreach ($cj in $job.ChildJobs) {
+    if ($cj.HasMoreData) {
+        $payloads.AddRange(@(Receive-Job -Job $cj))
+    }
+}
+Remove-Job -Job $job
 
 $results = [System.Collections.Generic.List[object]]::new()
 $skipped = [System.Collections.Generic.List[object]]::new()

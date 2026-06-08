@@ -104,10 +104,18 @@ function Invoke-Api {
         catch {
             $statusCode = $null
             $retryAfter = $null
+            $errorJson  = $null
 
             try {
-                if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
-                    $statusCode = [int]$_.Exception.Response.StatusCode
+                if ($_.Exception.Response) {
+                    if ($_.Exception.Response.StatusCode) {
+                        $statusCode = [int]$_.Exception.Response.StatusCode
+                    }
+                    $errorStream = $_.Exception.Response.GetResponseStream()
+                    if ($errorStream) {
+                        $reader = [System.IO.StreamReader]::new($errorStream)
+                        $errorJson = $reader.ReadToEnd()
+                    }
                 }
             }
             catch {
@@ -131,6 +139,9 @@ function Invoke-Api {
             $isTransient = $statusCode -in @(429, 500, 502, 503, 504)
 
             if (-not $isTransient -or $attempt -ge $Retries) {
+                if ($errorJson) {
+                    Write-Warning "API Error on URI $Uri : HTTP $statusCode - $errorJson"
+                }
                 return $null
             }
 
