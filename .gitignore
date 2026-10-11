@@ -1,0 +1,6 @@
+# BOM & Artifact working directory
+oss/
+
+# Temporary and log files
+*.log
+*.tmp
